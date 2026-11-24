@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .config import Settings
+from .lookup import LookupError, LookupService
 from .publisher import PublishError, publish
 from .service import DatasetService
 from .timeutil import parse_date
@@ -151,6 +154,46 @@ def read_day_rows(
         "rows_total": table.num_rows,
         "columns": table.column_names,
         "records": truncated.to_pylist(),
+    }
+
+
+@app.get("/batches/lookup")
+def lookup_batch(
+    version: int = Query(..., ge=1, description="当前清单版号（取自 /manifest）"),
+    source_file: str = Query(
+        ..., description="原档相对 input_dir 的 POSIX 相对路径"
+    ),
+    start: int = Query(..., ge=0, description="从 0 起算的原档起始行号"),
+    limit: int = Query(
+        ..., ge=1, le=1_000_000, description="本次抽查条数（按原档行序）"
+    ),
+):
+    """批次回查：按原档行号区间返回过磅明细与原行号。
+
+    请求开始核对版号，整页使用同一版清单快照；旧版号提示重取清单，
+    当前版的旧拆片无行位映射时提示无法回查。
+    """
+    rel = Path(source_file)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(
+            status_code=422, detail={"code": "bad_path", "error": "只允许 input_dir 内的相对路径"}
+        )
+    try:
+        result = LookupService(get_settings()).lookup(version, source_file, start, limit)
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "error": str(exc)},
+        )
+    return {
+        "version": result.version,
+        "source_file": result.source_file,
+        "start": result.start,
+        "limit": result.limit,
+        "rows_total": result.total_rows,
+        "rows_returned": len(result.records),
+        "columns": result.columns,
+        "records": result.records,
     }
 
 

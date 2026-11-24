@@ -135,13 +135,21 @@ def test_write_failure_mid_publish_keeps_previous_version(settings, monkeypatch)
     ])
 
     real_write = pq.write_table
+    real_writer = pq.ParquetWriter
 
     def flaky_write(table, where, *args, **kwargs):
-        if str(where).endswith(".tmp"):
+        if str(where).endswith(".tmp") or ".tmp-" in str(where):
             raise OSError("模拟磁盘写入失败")
         return real_write(table, where, *args, **kwargs)
 
+    class FlakyWriter:
+        def __new__(cls, where, *args, **kwargs):
+            if str(where).endswith(".tmp") or ".tmp-" in str(where):
+                raise OSError("模拟磁盘写入失败")
+            return real_writer(where, *args, **kwargs)
+
     monkeypatch.setattr(pq, "write_table", flaky_write)
+    monkeypatch.setattr(pq, "ParquetWriter", FlakyWriter)
     with pytest.raises(OSError):
         publish(["mixed.parquet"], settings)
 

@@ -35,6 +35,10 @@ class DayFile:
     source: str  # "original" 直接登记原档 | "split" 跨日拆写产物
     source_file: str  # 输入文件相对 input_dir 的路径
     rows: int
+    # 仅 split 条目：行位映射 Parquet（相对 staged/ 的路径），单列 int64
+    # source_row_index，逐行对应本拆片各行在原档中的 0 起行号；
+    # None 表示该清单产生时还没有映射（旧版拆片），批次回查将明确拒绝。
+    row_map: str | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +92,14 @@ class ManifestStore:
         with open(self.current_path, "r", encoding="utf-8") as f:
             return Manifest.from_dict(json.load(f))
 
+    def load_version(self, version: int) -> Manifest | None:
+        """按版本号读归档清单；不存在（含尚未换版的失败发布）返回 None。"""
+        archive = self.versions_dir / f"manifest-v{int(version):06d}.json"
+        if not archive.is_file():
+            return None
+        with open(archive, "r", encoding="utf-8") as f:
+            return Manifest.from_dict(json.load(f))
+
     def next_version(self) -> int:
         current = self.load_current()
         return (current.version + 1) if current else 1
@@ -122,6 +134,17 @@ class ManifestStore:
                 pass
             raise
 
+    def resolve_staged(self, rel_path: str) -> Path:
+        """把相对 staged/ 的路径解析成实际文件路径，并防目录穿越。"""
+        p = Path(rel_path)
+        if p.is_absolute() or ".." in p.parts:
+            raise ValueError("路径越界")
+        root = self.staged_dir.resolve()
+        candidate = (root / p).resolve()
+        if root not in candidate.parents and candidate != root:
+            raise ValueError("路径越界")
+        return candidate
+
     def resolve(self, day_file: "DayFile", input_dir: Path | None = None) -> Path:
         """把清单条目解析成实际文件路径，并防目录穿越。"""
         if day_file.source == "original":
@@ -132,8 +155,4 @@ class ManifestStore:
             if root not in candidate.parents and candidate != root:
                 raise ValueError("路径越界")
             return candidate
-        root = self.staged_dir.resolve()
-        candidate = (self.staged_dir / day_file.path).resolve()
-        if root not in candidate.parents and candidate != root:
-            raise ValueError("路径越界")
-        return candidate
+        return self.resolve_staged(day_file.path)

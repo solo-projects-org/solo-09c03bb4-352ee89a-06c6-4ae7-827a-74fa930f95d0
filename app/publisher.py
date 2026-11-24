@@ -35,6 +35,9 @@ MIXED = "mixed"
 EMPTY_TIME = "empty_time"
 UNKNOWN = "unknown"  # 页脚证明不了，需要读明细
 
+# 行位映射 Parquet 的唯一列名：逐行记录拆片各行在原档中的 0 起行号
+ROW_MAP_COLUMN = "source_row_index"
+
 
 class PublishError(RuntimeError):
     """发布失败；触发后上一版清单继续生效。"""
@@ -187,36 +190,83 @@ def _split_and_write(
     settings: Settings,
     rel_input: str,
 ) -> list[DayFile]:
-    table = pf.read()  # 跨日才读全表
-    if table.num_rows != dates.length():
+    """按原档 row group 逐组读、按 UTC 日拆写，并为每个拆片同步写行位映射。
+
+    数据拆片与映射片用同一组 ParquetWriter、按原档 row group 顺序同步写出，
+    因此两者的第 i 个 row group 一一对应；映射表单列 int64
+    ``source_row_index``，逐行给出该拆片行在原档中的 0 起行号（全局唯一、
+    单调递增；票号/内容相同的行也各占一个原行号，回查时各返回一次）。
+    全部走临时文件 + os.replace，目录里不会出现半成品。
+    """
+    if pf.metadata.num_rows != dates.length():
         raise PublishError(f"{rel_input} 日期数组与表行数不一致，放弃发布")
+    total_rows = pf.metadata.num_rows
     unique = pc.unique(dates).to_pylist()
-    day_files: list[DayFile] = []
-    used_names: set[str] = set()
     stem = Path(rel_input).stem
+
+    data_writers: dict[_dt.date, pq.ParquetWriter] = {}
+    map_writers: dict[_dt.date, pq.ParquetWriter] = {}
+    data_tmp: dict[_dt.date, Path] = {}
+    map_tmp: dict[_dt.date, Path] = {}
+    map_schema = pa.schema([pa.field(ROW_MAP_COLUMN, pa.int64(), nullable=False)])
+    day_rows: dict[_dt.date, int] = {}
+    try:
+        global_offset = 0
+        for rg in range(pf.metadata.num_row_groups):
+            rg_table = pf.read_row_group(rg)  # 只逐行组读一次，不再额外读全表
+            rg_dates = dates.slice(global_offset, rg_table.num_rows)
+            group_base = global_offset
+            global_offset += rg_table.num_rows
+            for day in sorted(pc.unique(rg_dates).to_pylist()):
+                day_str = day.isoformat()
+                if day not in data_writers:
+                    data_tmp[day] = dest_dir / f".tmp-{stem}__{day_str}.parquet"
+                    map_tmp[day] = dest_dir / f".tmp-{stem}__{day_str}.rowmap.parquet"
+                    data_writers[day] = pq.ParquetWriter(
+                        data_tmp[day], rg_table.schema, compression="snappy"
+                    )
+                    map_writers[day] = pq.ParquetWriter(
+                        map_tmp[day], map_schema, compression="snappy"
+                    )
+                    day_rows[day] = 0
+                mask = pc.equal(rg_dates, pa.scalar(day, type=pa.date32()))
+                part = rg_table.filter(mask)
+                if part.num_rows == 0:
+                    continue
+                # 命中行在原档内的全局行号；两表同步写，行组天然对齐
+                indices = pc.indices_nonzero(mask).cast(pa.int64())
+                index_col = pc.add(indices, pa.scalar(group_base, type=pa.int64()))
+                map_table = pa.table({ROW_MAP_COLUMN: index_col}, schema=map_schema)
+                data_writers[day].write_table(part)
+                map_writers[day].write_table(map_table)
+                day_rows[day] += part.num_rows
+    finally:
+        for w in data_writers.values():
+            w.close()
+        for w in map_writers.values():
+            w.close()
+
+    if sum(day_rows.values()) != total_rows:
+        raise PublishError(f"{rel_input} 拆写行数核对失败，放弃发布")
+
+    day_files: list[DayFile] = []
     for day in sorted(unique):
-        day_str = day.isoformat()
-        name = f"{stem}__{day_str}.parquet"
-        if name in used_names:
-            name = f"{stem}__{day_str}__{len(used_names) + 1}.parquet"
-        used_names.add(name)
-        dest = dest_dir / name
-        mask = pc.equal(dates, pa.scalar(day, type=pa.date32()))
-        part = table.filter(mask)
-        if part.num_rows == 0:
+        if day_rows.get(day, 0) == 0:
             continue
-        # 临时文件 + os.replace，保证输出目录里不会出现半成品
-        tmp = dest.with_suffix(".parquet.tmp")
-        pq.write_table(part, tmp, compression="snappy")
-        os.replace(tmp, dest)
+        day_str = day.isoformat()
+        data_name = f"{stem}__{day_str}.parquet"
+        map_name = f"{stem}__{day_str}.rowmap.parquet"
+        os.replace(data_tmp[day], dest_dir / data_name)
+        os.replace(map_tmp[day], dest_dir / map_name)
         day_files.append(
             DayFile(
                 date=day_str,
                 # staged_dir 形如 <output>/staged/v000006，路径相对 staged/ 存放
-                path=os.path.join(dest_dir.name, name),
+                path=os.path.join(dest_dir.name, data_name),
                 source="split",
                 source_file=rel_input,
-                rows=part.num_rows,
+                rows=day_rows[day],
+                row_map=os.path.join(dest_dir.name, map_name),
             )
         )
     return day_files
@@ -346,6 +396,9 @@ def publish(input_files: list[str], settings: Settings) -> PublishResult:
             # 每个输入文件的记录必须且只能落在其实际过磅日；
             # 按 (date, source_file) 复核行数不重不漏
             _check_coverage(abs_paths, rel_paths, all_day_files, settings)
+            # 换版闸门：拆片与行位映射齐全、且各自对应原档后才允许换版；
+            # 任一项不满足都抛错，current.json 保持上一版（失败仍可回查上一版）
+            _verify_split_mappings(abs_paths, rel_paths, all_day_files, store, version)
 
             all_day_files.sort(key=lambda d: (d.date, d.source_file, d.path))
             manifest = Manifest(
@@ -387,3 +440,76 @@ def _check_coverage(
             raise PublishError(
                 f"{rel} 行数核对失败: 输入 {expected} 行, 发布 {actual_rows[rel]} 行"
             )
+
+
+def _verify_split_mappings(
+    abs_paths: list[Path],
+    rel_paths: list[str],
+    day_files: list[DayFile],
+    store: ManifestStore,
+    version: int,
+) -> None:
+    """换版前校验：每个拆片都有行位映射，且映射与原档逐行对得上。
+
+    只读 Parquet 页脚与映射列本身（不读拆片数据行）；任何不满足都中止发布，
+    current.json 不会被替换。同一原档的全部映射行号合并后必须恰好覆盖
+    [0, 原档行数)，无重复、无越界，从而保证按原行号回查不重不漏。
+    """
+    source_rows = {
+        rel: pq.ParquetFile(abs_path).metadata.num_rows
+        for rel, abs_path in zip(rel_paths, abs_paths)
+    }
+    grouped: dict[str, list[DayFile]] = {}
+    for df in day_files:
+        if df.source == "split":
+            grouped.setdefault(df.source_file, []).append(df)
+
+    prefix = f"v{int(version):06d}/"
+    for rel, entries in grouped.items():
+        if rel not in source_rows:
+            raise PublishError(f"拆片来源文件不在本次发布清单内: {rel}")
+        all_indices: list[int] = []
+        for df in entries:
+            if not df.row_map:
+                raise PublishError(f"{rel} 的拆片 {df.path} 缺少行位映射，放弃换版")
+            if not df.row_map.startswith(prefix):
+                raise PublishError(
+                    f"{rel} 的行位映射不属于本次版本目录 v{version:06d}: {df.row_map}"
+                )
+            map_path = store.resolve_staged(df.row_map)
+            if not map_path.is_file():
+                raise PublishError(f"{rel} 的行位映射文件缺失: {df.row_map}")
+            data_path = store.resolve_staged(df.path)
+            if not data_path.is_file():
+                raise PublishError(f"{rel} 的拆片文件缺失: {df.path}")
+            map_pf = pq.ParquetFile(map_path)
+            data_pf = pq.ParquetFile(data_path)
+            if map_pf.metadata.num_rows != df.rows or data_pf.metadata.num_rows != df.rows:
+                raise PublishError(
+                    f"{rel} 拆片 {df.path} 行数与映射/登记不一致，放弃换版"
+                )
+            if map_pf.metadata.num_row_groups != data_pf.metadata.num_row_groups:
+                raise PublishError(
+                    f"{rel} 拆片 {df.path} 与映射的行组不对齐，放弃换版"
+                )
+            col_index = map_pf.metadata.schema.names.index(ROW_MAP_COLUMN)
+            for rg in range(map_pf.metadata.num_row_groups):
+                stats = map_pf.metadata.row_group(rg).column(col_index).statistics
+                if stats is not None and stats.min is not None and stats.max is not None:
+                    if stats.min < 0 or stats.max >= source_rows[rel]:
+                        raise PublishError(
+                            f"{rel} 行位映射出现越界原档行号，放弃换版"
+                        )
+            # 覆盖核对只读映射列本身，不读拆片数据行
+            map_table = map_pf.read(columns=[ROW_MAP_COLUMN])
+            all_indices.extend(map_table.column(0).to_pylist())
+
+        total = source_rows[rel]
+        if len(all_indices) != total:
+            raise PublishError(
+                f"{rel} 行位映射合计 {len(all_indices)} 行，与原档 {total} 行不符，放弃换版"
+            )
+        if len(set(all_indices)) != len(all_indices):
+            raise PublishError(f"{rel} 行位映射存在重复原行号，放弃换版")
+        if sorted(all_indices) != list(range(total)):
+            raise PublishError(f"{rel} 行位映射未连续覆盖原档全部行号，放弃换版")

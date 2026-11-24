@@ -13,6 +13,7 @@ import json
 import sys
 
 from .config import Settings
+from .lookup import LookupError, LookupService
 from .publisher import PublishError, publish
 from .service import DatasetService
 
@@ -29,6 +30,14 @@ def main(argv: list[str] | None = None) -> int:
     p_read = sub.add_parser("read", help="按 UTC 日期读取并打印 JSON 行")
     p_read.add_argument("day")
     p_read.add_argument("--limit", type=int, default=1000)
+
+    p_lookup = sub.add_parser(
+        "lookup", help="批次回查：按版号/原档/起始行号/条数打印原行明细"
+    )
+    p_lookup.add_argument("version", type=int)
+    p_lookup.add_argument("source_file")
+    p_lookup.add_argument("start", type=int)
+    p_lookup.add_argument("limit", type=int)
 
     args = parser.parse_args(argv)
     settings = Settings.from_env()
@@ -64,6 +73,26 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for row in table.slice(0, args.limit).to_pylist():
             print(json.dumps(row, ensure_ascii=False, default=str))
+        return 0
+
+    if args.cmd == "lookup":
+        try:
+            result = LookupService(settings).lookup(
+                args.version, args.source_file, args.start, args.limit
+            )
+        except LookupError as exc:
+            print(f"回查失败: {exc}", file=sys.stderr)
+            return 2
+        payload = {
+            "version": result.version,
+            "source_file": result.source_file,
+            "start": result.start,
+            "limit": result.limit,
+            "rows_total": result.total_rows,
+            "rows_returned": len(result.records),
+            "records": result.records,
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return 0
 
     return 1
